@@ -1,21 +1,46 @@
 """
 claude_mapper.py
+
 Calls AWS Bedrock (Claude Sonnet 4, us-east-1) to map PDF fields → applicant data.
 Also identifies missing fields that need user input.
+
+FIX: All three mapping functions now process pages ONE AT A TIME and merge results,
+     preventing token-limit errors on multi-page documents.
 """
 
 import json
+import base64
+import io
 import boto3
+from PIL import Image
 
-# ── Bedrock client ───────────────────────────────────────────────────────────
+# ── Bedrock client ────────────────────────────────────────────────────────────
 BEDROCK_REGION = "us-east-1"
 MODEL_ID = "us.anthropic.claude-sonnet-4-20250514-v1:0"
 
 bedrock = boto3.client("bedrock-runtime", region_name=BEDROCK_REGION)
 
+# ── Image resize cap ──────────────────────────────────────────────────────────
+MAX_IMAGE_WIDTH = 1200  # px — anything wider gets downscaled
 
-# ── Shared invoke helper ─────────────────────────────────────────────────────
 
+def _resize_b64_image(b64_data: str, max_width: int = MAX_IMAGE_WIDTH) -> tuple[str, int, int]:
+    """Resize a base64 PNG so its width never exceeds max_width. Returns (new_b64, width, height)."""
+    img_bytes = base64.b64decode(b64_data)
+    img = Image.open(io.BytesIO(img_bytes))
+    w, h = img.size
+    if w > max_width:
+        ratio = max_width / w
+        new_w = max_width
+        new_h = int(h * ratio)
+        img = img.resize((new_w, new_h), Image.LANCZOS)
+        w, h = new_w, new_h
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return base64.b64encode(buf.getvalue()).decode("utf-8"), w, h
+
+
+# ── Shared invoke helper ──────────────────────────────────────────────────────
 def _invoke(system: str, user_content: list, max_tokens: int = 8192) -> str:
     body = json.dumps({
         "anthropic_version": "bedrock-2023-05-31",
@@ -28,8 +53,7 @@ def _invoke(system: str, user_content: list, max_tokens: int = 8192) -> str:
     return result["content"][0]["text"].strip()
 
 
-# ── Missing field detection ──────────────────────────────────────────────────
-
+# ── Missing field detection ───────────────────────────────────────────────────
 def detect_missing_fields(
     pdf_name: str,
     field_identifiers: list[str],
@@ -65,8 +89,7 @@ def detect_missing_fields(
     return _safe_parse_json(raw)
 
 
-# ── AcroForm mapping ─────────────────────────────────────────────────────────
-
+# ── AcroForm mapping (per-page chunked) ───────────────────────────────────────
 def map_fields_acroform(
     field_list: list[dict],
     page_images: list[dict],
@@ -74,60 +97,82 @@ def map_fields_acroform(
 ) -> list[dict]:
     """
     Maps AcroForm field IDs → applicant values.
+    Processes one page image at a time; merges results.
     Returns [{field_id, page, value}].
     """
     system = (
         "You are a document form-filling assistant. "
-        "Given PDF form field IDs and applicant data, map each field to the correct value. "
+        "Given PDF form field IDs for a SINGLE PAGE and applicant data, "
+        "map each field to the correct value. "
         "Respond ONLY with a valid JSON array. No markdown, no explanation. "
         'Format: [{"field_id": "...", "page": 1, "value": "..."}] '
         "Omit fields with no matching applicant data."
     )
 
-    user_content = _build_image_blocks(page_images) + [
-        {
-            "type": "text",
-            "text": (
-                f"FORM FIELDS:\n{json.dumps(field_list, indent=2)}\n\n"
-                f"APPLICANT DATA:\n{json.dumps(applicant_data, indent=2)}\n\n"
-                "Map every form field to the correct applicant value. "
-                "Use the page images to understand each field's purpose. "
-                "Return only the JSON array."
-            ),
-        }
-    ]
+    all_results: list[dict] = []
 
-    raw = _invoke(system, user_content)
-    return _safe_parse_json(raw)
+    for pg in page_images:
+        page_num = pg["page"]
+
+        # Only send fields that belong to this page
+        page_fields = [f for f in field_list if f.get("page") == page_num]
+        if not page_fields:
+            continue
+
+        b64, w, h = _resize_b64_image(pg["b64_image"])
+
+        user_content = [
+            {"type": "text", "text": f"Page {page_num} (width={w}px, height={h}px):"},
+            {
+                "type": "image",
+                "source": {"type": "base64", "media_type": "image/png", "data": b64},
+            },
+            {
+                "type": "text",
+                "text": (
+                    f"FORM FIELDS ON THIS PAGE:\n{json.dumps(page_fields, indent=2)}\n\n"
+                    f"APPLICANT DATA:\n{json.dumps(applicant_data, indent=2)}\n\n"
+                    "Map every form field on this page to the correct applicant value. "
+                    "Return only the JSON array."
+                ),
+            },
+        ]
+
+        raw = _invoke(system, user_content)
+        page_result = _safe_parse_json(raw)
+        if isinstance(page_result, list):
+            all_results.extend(page_result)
+
+    return all_results
 
 
-# ── Text-based PDF mapping ───────────────────────────────────────────────────
-
+# ── Text-based PDF mapping (per-page chunked) ─────────────────────────────────
 def map_fields_text_based(
     structure: dict,
     page_images: list[dict],
     applicant_data: dict,
 ) -> dict:
     """
-    For text-based non-fillable PDFs.
-    Returns fields.json-compatible dict with 'pages' and 'form_fields'.
+    For text-based non-fillable PDFs. Processes one page at a time, merges into
+    a single fields.json-compatible dict with 'pages' and 'form_fields'.
     """
     system = (
         "You are a document form-filling assistant. "
         "Given PDF structure data (labels, lines, checkboxes with coordinates) "
-        "and page images, identify all form fields and map applicant data to them. "
+        "for a SINGLE PAGE and the page image, identify all form fields and map "
+        "applicant data to them. "
         "Respond ONLY with a valid JSON object. No markdown, no explanation.\n\n"
         "Required format:\n"
         "{\n"
-        "  \"pages\": [{\"page_number\": 1, \"pdf_width\": 612, \"pdf_height\": 792}],\n"
-        "  \"form_fields\": [\n"
+        '  "page_info": {"page_number": 1, "pdf_width": 612, "pdf_height": 792},\n'
+        '  "form_fields": [\n'
         "    {\n"
-        "      \"page_number\": 1,\n"
-        "      \"field_label\": \"Last Name\",\n"
-        "      \"description\": \"Applicant last name\",\n"
-        "      \"label_bounding_box\": [x0, top, x1, bottom],\n"
-        "      \"entry_bounding_box\": [x0, top, x1, bottom],\n"
-        "      \"entry_text\": {\"text\": \"Smith\", \"font_size\": 9}\n"
+        '      "page_number": 1,\n'
+        '      "field_label": "Last Name",\n'
+        '      "description": "Applicant last name",\n'
+        '      "label_bounding_box": [x0, top, x1, bottom],\n'
+        '      "entry_bounding_box": [x0, top, x1, bottom],\n'
+        '      "entry_text": {"text": "Smith", "font_size": 9}\n'
         "    }\n"
         "  ]\n"
         "}\n\n"
@@ -140,46 +185,84 @@ def map_fields_text_based(
         "- Coordinates come from the structure JSON"
     )
 
-    user_content = _build_image_blocks(page_images) + [
-        {
-            "type": "text",
-            "text": (
-                f"PDF STRUCTURE:\n{json.dumps(structure, indent=2)}\n\n"
-                f"APPLICANT DATA:\n{json.dumps(applicant_data, indent=2)}\n\n"
-                "Create the fields.json mapping. Return only the JSON object."
-            ),
+    merged_pages = []
+    merged_fields = []
+
+    # Build a per-page lookup for structure elements
+    all_labels = structure.get("labels", [])
+    all_lines = structure.get("lines", [])
+    all_checkboxes = structure.get("checkboxes", [])
+
+    for pg in page_images:
+        page_num = pg["page"]
+
+        # Find the page metadata from structure
+        page_meta = next(
+            (p for p in structure.get("pages", []) if p["page_number"] == page_num),
+            {"page_number": page_num, "pdf_width": pg["width"], "pdf_height": pg["height"]},
+        )
+
+        page_structure = {
+            "pages": [page_meta],
+            "labels": [l for l in all_labels if l.get("page") == page_num],
+            "lines": [l for l in all_lines if l.get("page") == page_num],
+            "checkboxes": [c for c in all_checkboxes if c.get("page") == page_num],
         }
-    ]
 
-    raw = _invoke(system, user_content)
-    return _safe_parse_json(raw)
+        b64, w, h = _resize_b64_image(pg["b64_image"])
+
+        user_content = [
+            {"type": "text", "text": f"Page {page_num} (width={w}px, height={h}px):"},
+            {
+                "type": "image",
+                "source": {"type": "base64", "media_type": "image/png", "data": b64},
+            },
+            {
+                "type": "text",
+                "text": (
+                    f"PDF STRUCTURE FOR THIS PAGE:\n{json.dumps(page_structure, indent=2)}\n\n"
+                    f"APPLICANT DATA:\n{json.dumps(applicant_data, indent=2)}\n\n"
+                    "Create the fields.json mapping for this page only. Return only the JSON object."
+                ),
+            },
+        ]
+
+        raw = _invoke(system, user_content)
+        page_result = _safe_parse_json(raw)
+
+        if isinstance(page_result, dict):
+            if "page_info" in page_result:
+                merged_pages.append(page_result["page_info"])
+            if "form_fields" in page_result:
+                merged_fields.extend(page_result["form_fields"])
+
+    return {"pages": merged_pages, "form_fields": merged_fields}
 
 
-# ── Scanned PDF mapping ──────────────────────────────────────────────────────
-
+# ── Scanned PDF mapping (per-page chunked) ────────────────────────────────────
 def map_fields_scanned(
     page_images: list[dict],
     applicant_data: dict,
 ) -> dict:
     """
-    For scanned/image-based PDFs.
-    Claude does full visual analysis using image coordinates.
+    For scanned/image-based PDFs. Processes one page at a time using Claude's
+    visual analysis, then merges all results into a single fields.json dict.
     """
     system = (
-        "You are a document form-filling assistant analyzing scanned form images. "
+        "You are a document form-filling assistant analyzing a SINGLE scanned form image. "
         "Identify all form fields visually and map applicant data to them. "
         "Respond ONLY with a valid JSON object. No markdown, no explanation.\n\n"
         "Required format:\n"
         "{\n"
-        "  \"pages\": [{\"page_number\": 1, \"image_width\": 1700, \"image_height\": 2200}],\n"
-        "  \"form_fields\": [\n"
+        '  "page_info": {"page_number": 1, "image_width": 1700, "image_height": 2200},\n'
+        '  "form_fields": [\n'
         "    {\n"
-        "      \"page_number\": 1,\n"
-        "      \"field_label\": \"Last Name\",\n"
-        "      \"description\": \"Applicant last name\",\n"
-        "      \"label_bounding_box\": [x0, top, x1, bottom],\n"
-        "      \"entry_bounding_box\": [x0, top, x1, bottom],\n"
-        "      \"entry_text\": {\"text\": \"Smith\", \"font_size\": 9}\n"
+        '      "page_number": 1,\n'
+        '      "field_label": "Last Name",\n'
+        '      "description": "Applicant last name",\n'
+        '      "label_bounding_box": [x0, top, x1, bottom],\n'
+        '      "entry_bounding_box": [x0, top, x1, bottom],\n'
+        '      "entry_text": {"text": "Smith", "font_size": 9}\n'
         "    }\n"
         "  ]\n"
         "}\n\n"
@@ -190,33 +273,54 @@ def map_fields_scanned(
         "- Only include fields with matching applicant data"
     )
 
-    user_content = _build_image_blocks(page_images) + [
-        {
-            "type": "text",
-            "text": (
-                f"APPLICANT DATA:\n{json.dumps(applicant_data, indent=2)}\n\n"
-                "Analyze these form images. Map applicant data to every matching field. "
-                "Return only the JSON object."
-            ),
-        }
-    ]
+    merged_pages = []
+    merged_fields = []
 
-    raw = _invoke(system, user_content)
-    return _safe_parse_json(raw)
+    for pg in page_images:
+        page_num = pg["page"]
+        b64, w, h = _resize_b64_image(pg["b64_image"])
+
+        user_content = [
+            {"type": "text", "text": f"Page {page_num} (width={w}px, height={h}px):"},
+            {
+                "type": "image",
+                "source": {"type": "base64", "media_type": "image/png", "data": b64},
+            },
+            {
+                "type": "text",
+                "text": (
+                    f"APPLICANT DATA:\n{json.dumps(applicant_data, indent=2)}\n\n"
+                    "Analyze this single form page. Map applicant data to every matching field. "
+                    "Return only the JSON object."
+                ),
+            },
+        ]
+
+        raw = _invoke(system, user_content)
+        page_result = _safe_parse_json(raw)
+
+        if isinstance(page_result, dict):
+            if "page_info" in page_result:
+                merged_pages.append(page_result["page_info"])
+            if "form_fields" in page_result:
+                merged_fields.extend(page_result["form_fields"])
+
+    return {"pages": merged_pages, "form_fields": merged_fields}
 
 
-# ── Helpers ──────────────────────────────────────────────────────────────────
-
+# ── Helpers ───────────────────────────────────────────────────────────────────
 def _build_image_blocks(page_images: list[dict]) -> list[dict]:
+    """Legacy helper kept for backward compatibility (not used by chunked functions)."""
     blocks = []
     for pg in page_images:
-        blocks.append({"type": "text", "text": f"Page {pg['page']} (width={pg['width']}px, height={pg['height']}px):"})
+        b64, w, h = _resize_b64_image(pg["b64_image"])
+        blocks.append({"type": "text", "text": f"Page {pg['page']} (width={w}px, height={h}px):"})
         blocks.append({
             "type": "image",
             "source": {
                 "type": "base64",
                 "media_type": "image/png",
-                "data": pg["b64_image"],
+                "data": b64,
             },
         })
     return blocks
