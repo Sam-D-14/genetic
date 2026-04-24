@@ -1,5 +1,6 @@
 """
 pipeline.py
+
 Orchestrates the full pipeline for N applicants × M PDFs.
 
 For each (applicant, pdf) pair:
@@ -8,6 +9,9 @@ For each (applicant, pdf) pair:
 3. Detect missing fields → return them for UI prompting
 4. (After user fills missing fields) Map + fill PDF
 5. Collect all filled PDFs → zip by applicant folder
+
+FIX: render_pages_as_base64 now called at dpi=100 (was 150) to reduce
+     Bedrock token usage and avoid prompt-too-long errors on multi-page forms.
 """
 
 import io
@@ -31,7 +35,6 @@ from pdf_filler import fill_acroform, fill_with_annotations
 
 
 # ── Phase 1: Analyse all PDFs and detect missing fields ──────────────────────
-
 def analyse_pdfs(
     pdf_files: dict[str, bytes],
     applicants: list[dict],
@@ -41,18 +44,18 @@ def analyse_pdfs(
     Pre-analyses all uploaded PDFs and detects fields missing from applicant data.
 
     Args:
-        pdf_files: {filename: pdf_bytes}
-        applicants: list of applicant dicts
+        pdf_files:         {filename: pdf_bytes}
+        applicants:        list of applicant dicts
         progress_callback: callable(msg)
 
     Returns:
         analysis: {
             pdf_name: {
                 "type": "acroform"|"text"|"scanned",
-                "field_ids": [...],          # for missing-field detection
-                "structure": {...},           # for text-based
-                "page_images": [...],         # rendered pages
-                "acroform_fields": [...],     # for acroform only
+                "field_ids": [...],        # for missing-field detection
+                "structure": {...},        # for text-based
+                "page_images": [...],      # rendered pages at 100 DPI
+                "acroform_fields": [...],  # for acroform only
             }
         }
     """
@@ -65,10 +68,11 @@ def analyse_pdfs(
     for pdf_name, pdf_bytes in pdf_files.items():
         log(f"🔍 Analysing **{pdf_name}**...")
         pdf_type = detect_pdf_type(pdf_bytes)
-        log(f"   Type: `{pdf_type}`")
+        log(f"  Type: `{pdf_type}`")
 
-        page_images = render_pages_as_base64(pdf_bytes, dpi=150)
-        log(f"   Rendered {len(page_images)} page(s)")
+        # FIX: dpi=100 instead of 150
+        page_images = render_pages_as_base64(pdf_bytes, dpi=100)
+        log(f"  Rendered {len(page_images)} page(s) at 100 DPI")
 
         entry = {
             "type": pdf_type,
@@ -82,13 +86,13 @@ def analyse_pdfs(
             fields = extract_acroform_fields(pdf_bytes)
             entry["acroform_fields"] = fields
             entry["field_ids"] = [f["field_id"] for f in fields]
-            log(f"   Found {len(fields)} AcroForm field(s)")
+            log(f"  Found {len(fields)} AcroForm field(s)")
 
         elif pdf_type == "text":
             structure = extract_text_structure(pdf_bytes)
             entry["structure"] = structure
             entry["field_ids"] = [lbl["text"] for lbl in structure.get("labels", [])]
-            log(f"   Extracted {len(entry['field_ids'])} text label(s)")
+            log(f"  Extracted {len(entry['field_ids'])} text label(s)")
 
         analysis[pdf_name] = entry
 
@@ -105,18 +109,17 @@ def analyse_pdfs(
                 )
                 entry["missing_fields"] = missing
                 if missing:
-                    log(f"   ⚠️ {len(missing)} field(s) need user input")
+                    log(f"  ⚠️ {len(missing)} field(s) need user input")
                 else:
-                    log(f"   ✅ All fields covered by applicant data")
+                    log(f"  ✅ All fields covered by applicant data")
             except Exception as e:
-                log(f"   ⚠️ Could not detect missing fields: {e}")
+                log(f"  ⚠️ Could not detect missing fields: {e}")
                 entry["missing_fields"] = []
 
     return analysis
 
 
 # ── Phase 2: Fill all PDFs and build ZIP ─────────────────────────────────────
-
 def fill_all_and_zip(
     pdf_files: dict[str, bytes],
     applicants: list[dict],
@@ -128,10 +131,10 @@ def fill_all_and_zip(
     Fills all PDFs for all applicants and returns a ZIP archive.
 
     Args:
-        pdf_files: {filename: pdf_bytes}
-        applicants: list of applicant dicts
-        analysis: output from analyse_pdfs()
-        user_overrides: {field_label: value} — user-provided values for missing fields
+        pdf_files:         {filename: pdf_bytes}
+        applicants:        list of applicant dicts
+        analysis:          output from analyse_pdfs()
+        user_overrides:    {field_label: value} — user-provided values for missing fields
         progress_callback: callable(msg)
 
     Returns:
@@ -145,7 +148,9 @@ def fill_all_and_zip(
 
     with zipfile.ZipFile(zip_buf, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
         for applicant in applicants:
-            folder = _safe_folder_name(applicant.get("full_name", applicant.get("id", "applicant")))
+            folder = _safe_folder_name(
+                applicant.get("full_name", applicant.get("id", "applicant"))
+            )
             merged_data = {**applicant, **user_overrides}
 
             for pdf_name, pdf_bytes in pdf_files.items():
@@ -163,17 +168,15 @@ def fill_all_and_zip(
                     )
                     arc_path = f"{folder}/{pdf_name}"
                     zf.writestr(arc_path, filled)
-                    log(f"   ✅ Done → {arc_path}")
-
+                    log(f"  ✅ Done → {arc_path}")
                 except Exception as e:
-                    log(f"   ❌ Error filling {pdf_name} for {applicant['full_name']}: {e}")
+                    log(f"  ❌ Error filling {pdf_name} for {applicant['full_name']}: {e}")
 
     zip_buf.seek(0)
     return zip_buf.getvalue()
 
 
 # ── Internal: fill a single PDF ───────────────────────────────────────────────
-
 def _fill_single(
     pdf_bytes: bytes,
     pdf_name: str,
@@ -208,4 +211,4 @@ def _fill_single(
 
 
 def _safe_folder_name(name: str) -> str:
-    return re.sub(r"[^\w\-_. ]", "_", name).strip().replace(" ", "_")
+    return re.sub(r"[^\w\-\_. ]", "_", name).strip().replace(" ", "_")
