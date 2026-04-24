@@ -1,15 +1,24 @@
 """
 pdf_detector.py
+
 Detects PDF type (fillable AcroForm vs text-based vs scanned)
 and extracts raw structure for Claude to analyze.
+
+FIX: render_pages_as_base64 now defaults to 100 DPI (was 150) and caps
+     rendered page width at 1200px to keep Bedrock token usage under control.
 """
 
 import base64
+import io
 import tempfile
-
 import fitz  # pymupdf
 import pdfplumber
+from PIL import Image
 from pypdf import PdfReader
+
+# ── Image rendering constants ─────────────────────────────────────────────────
+DEFAULT_DPI = 100          # was 150 — ~55% fewer image tokens with negligible quality loss
+MAX_PAGE_WIDTH_PX = 1200   # hard cap; wider pages get downscaled
 
 
 def detect_pdf_type(pdf_bytes: bytes) -> str:
@@ -38,6 +47,7 @@ def extract_acroform_fields(pdf_bytes: bytes) -> list[dict]:
         annotations = page.get("/Annots", [])
         if not annotations:
             continue
+
         for annot in annotations:
             obj = annot.get_object()
             ft = obj.get("/FT")
@@ -65,6 +75,7 @@ def extract_text_structure(pdf_bytes: bytes) -> dict:
                 "pdf_width": float(page.width),
                 "pdf_height": float(page.height),
             })
+
             for w in page.extract_words():
                 structure["labels"].append({
                     "page": page_num,
@@ -74,6 +85,7 @@ def extract_text_structure(pdf_bytes: bytes) -> dict:
                     "x1": round(float(w["x1"]), 1),
                     "bottom": round(float(w["bottom"]), 1),
                 })
+
             for line in page.lines:
                 if abs(float(line["x1"]) - float(line["x0"])) > page.width * 0.4:
                     structure["lines"].append({
@@ -82,10 +94,11 @@ def extract_text_structure(pdf_bytes: bytes) -> dict:
                         "x0": round(float(line["x0"]), 1),
                         "x1": round(float(line["x1"]), 1),
                     })
+
             for rect in page.rects:
-                w = float(rect["x1"]) - float(rect["x0"])
-                h = float(rect["bottom"]) - float(rect["top"])
-                if 5 <= w <= 15 and 5 <= h <= 15 and abs(w - h) < 3:
+                rw = float(rect["x1"]) - float(rect["x0"])
+                rh = float(rect["bottom"]) - float(rect["top"])
+                if 5 <= rw <= 15 and 5 <= rh <= 15 and abs(rw - rh) < 3:
                     structure["checkboxes"].append({
                         "page": page_num,
                         "x0": round(float(rect["x0"]), 1),
@@ -97,20 +110,40 @@ def extract_text_structure(pdf_bytes: bytes) -> dict:
     return structure
 
 
-def render_pages_as_base64(pdf_bytes: bytes, dpi: int = 150) -> list[dict]:
-    """Renders each PDF page as a base64 PNG for Claude visual analysis."""
+def render_pages_as_base64(pdf_bytes: bytes, dpi: int = DEFAULT_DPI) -> list[dict]:
+    """
+    Renders each PDF page as a base64 PNG for Claude visual analysis.
+
+    Changes from original:
+    - Default DPI lowered from 150 → 100 (~55% token reduction)
+    - Pages wider than MAX_PAGE_WIDTH_PX are downscaled via Pillow before encoding
+    """
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     pages = []
+
     for i, page in enumerate(doc):
         mat = fitz.Matrix(dpi / 72, dpi / 72)
         pix = page.get_pixmap(matrix=mat)
         img_bytes = pix.tobytes("png")
+
+        # Downscale wide pages to cap token usage
+        img = Image.open(io.BytesIO(img_bytes))
+        w, h = img.size
+        if w > MAX_PAGE_WIDTH_PX:
+            ratio = MAX_PAGE_WIDTH_PX / w
+            img = img.resize((MAX_PAGE_WIDTH_PX, int(h * ratio)), Image.LANCZOS)
+            w, h = img.size
+            buf = io.BytesIO()
+            img.save(buf, format="PNG")
+            img_bytes = buf.getvalue()
+
         pages.append({
             "page": i + 1,
-            "width": pix.width,
-            "height": pix.height,
+            "width": w,
+            "height": h,
             "b64_image": base64.b64encode(img_bytes).decode("utf-8"),
         })
+
     doc.close()
     return pages
 
