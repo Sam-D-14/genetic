@@ -1,4 +1,4 @@
-import React, { useState } from "react";
+import React, { useState, useEffect } from "react";
 import { api } from "../../api/client";
 import {
   CloudUpload as UploadIcon,
@@ -6,71 +6,37 @@ import {
   Calculate as CalculateIcon,
   Description as DescriptionIcon
 } from "@mui/icons-material";
+import { buildCacheKey, cacheGet, cacheSet, cacheDel } from "../../utils/excelCache";
 
 const INDUSTRY_DATA = {
   "Banking / Financial Services": {
     benchmarks: {
-      "Profit Before Tax (PBT)": {
-        range_min: 0.5,
-        range_max: 2.0,
-        description: "0.5% – 2% of PBT"
-      },
-      "Total Assets": {
-        range_min: 0.25,
-        range_max: 0.5,
-        description: "0.25% – 0.5% of Total Assets"
-      }
+      "Profit Before Tax (PBT)": { range_min: 0.5, range_max: 2.0, description: "0.5% – 2% of PBT" },
+      "Total Assets": { range_min: 0.25, range_max: 0.5, description: "0.25% – 0.5% of Total Assets" }
     },
     performance_pct: 75,
     tolerable_pct: 5
   },
-
   Insurance: {
     benchmarks: {
-      "Gross Written Premiums (GWP)": {
-        range_min: 0.5,
-        range_max: 1.0,
-        description: "0.5% – 1% of GWP"
-      },
-      "Net Assets": {
-        range_min: 0.5,
-        range_max: 1.0,
-        description: "0.5% – 1% of Net Assets"
-      }
+      "Gross Written Premiums (GWP)": { range_min: 0.5, range_max: 1.0, description: "0.5% – 1% of GWP" },
+      "Net Assets": { range_min: 0.5, range_max: 1.0, description: "0.5% – 1% of Net Assets" }
     },
     performance_pct: 70,
     tolerable_pct: 5
   },
-
   Manufacturing: {
     benchmarks: {
-      Revenue: {
-        range_min: 0.5,
-        range_max: 1.0,
-        description: "0.5% – 1% of Revenue"
-      },
-      "Profit Before Tax (PBT)": {
-        range_min: 5.0,
-        range_max: 5.0,
-        description: "5% of PBT"
-      }
+      Revenue: { range_min: 0.5, range_max: 1.0, description: "0.5% – 1% of Revenue" },
+      "Profit Before Tax (PBT)": { range_min: 5.0, range_max: 5.0, description: "5% of PBT" }
     },
     performance_pct: 75,
     tolerable_pct: 5
   },
-
   "Retail / Consumer": {
     benchmarks: {
-      Revenue: {
-        range_min: 0.25,
-        range_max: 0.5,
-        description: "0.25% – 0.5% of Revenue"
-      },
-      "Gross Profit": {
-        range_min: 5.0,
-        range_max: 5.0,
-        description: "5% of Gross Profit"
-      }
+      Revenue: { range_min: 0.25, range_max: 0.5, description: "0.25% – 0.5% of Revenue" },
+      "Gross Profit": { range_min: 5.0, range_max: 5.0, description: "5% of Gross Profit" }
     },
     performance_pct: 70,
     tolerable_pct: 5
@@ -78,22 +44,12 @@ const INDUSTRY_DATA = {
 };
 
 export default function Materiality() {
-  const [industry, setIndustry] = useState(
-    "Banking / Financial Services"
-  );
-
-  const [benchmark, setBenchmark] = useState(
-    "Profit Before Tax (PBT)"
-  );
-
-  // overall materiality percentage (0–100)
+  const [industry, setIndustry] = useState("Banking / Financial Services");
+  const [benchmark, setBenchmark] = useState("Profit Before Tax (PBT)");
   const [overallPct, setOverallPct] = useState(1.0);
-
-  // performance + tolerable should also be editable %
   const [performancePct, setPerformancePct] = useState(
     INDUSTRY_DATA["Banking / Financial Services"].performance_pct
   );
-
   const [tolerablePct, setTolerablePct] = useState(
     INDUSTRY_DATA["Banking / Financial Services"].tolerable_pct
   );
@@ -101,6 +57,7 @@ export default function Materiality() {
   const [pdfFile, setPdfFile] = useState(null);
   const [extracting, setExtracting] = useState(false);
   const [extractedData, setExtractedData] = useState(null);
+  const [fromCache, setFromCache] = useState(false);
 
   const [useManual, setUseManual] = useState(false);
   const [manualValue, setManualValue] = useState("");
@@ -111,43 +68,57 @@ export default function Materiality() {
   const [generating, setGenerating] = useState(false);
 
   const industryConfig = INDUSTRY_DATA[industry];
-  const benchmarkOptions = Object.keys(
-    industryConfig.benchmarks
-  );
+  const benchmarkOptions = Object.keys(industryConfig.benchmarks);
 
-  const benchmarkConfig =
-    industryConfig.benchmarks[benchmark];
-
-  const unitMultiplier = {
-    Units: 1,
-    Thousands: 1000,
-    Millions: 1000000,
-    Billions: 1000000000
-  };
+  const unitMultiplier = { Units: 1, Thousands: 1000, Millions: 1000000, Billions: 1000000000 };
 
   const formatCurrency = (value, currency = "£") => {
     if (!value) return `${currency}0`;
-
-    if (value >= 1_000_000_000)
-      return `${currency}${(value / 1_000_000_000).toFixed(2)}B`;
-
-    if (value >= 1_000_000)
-      return `${currency}${(value / 1_000_000).toFixed(2)}M`;
-
-    if (value >= 1000)
-      return `${currency}${(value / 1000).toFixed(2)}K`;
-
+    if (value >= 1_000_000_000) return `${currency}${(value / 1_000_000_000).toFixed(2)}B`;
+    if (value >= 1_000_000) return `${currency}${(value / 1_000_000).toFixed(2)}M`;
+    if (value >= 1000) return `${currency}${(value / 1000).toFixed(2)}K`;
     return `${currency}${Number(value).toLocaleString()}`;
+  };
+
+  // When a new PDF is selected, try to restore from cache
+  const handleFileChange = (file) => {
+    setPdfFile(file);
+    setExtractedData(null);
+    setFromCache(false);
+    setCalcResults(null);
+    setAnalysis("");
+
+    if (!file) return;
+
+    const key = buildCacheKey(file, "materiality-extract");
+    const cached = cacheGet(key);
+    if (cached) {
+      setExtractedData(cached);
+      setFromCache(true);
+    }
   };
 
   const handleExtract = async () => {
     if (!pdfFile) return;
 
+    const key = buildCacheKey(pdfFile, "materiality-extract");
+
+    // Check cache first — skip API if hit
+    const cached = cacheGet(key);
+    if (cached) {
+      setExtractedData(cached);
+      setFromCache(true);
+      alert("Loaded from cache ⚡");
+      return;
+    }
+
     setExtracting(true);
+    setFromCache(false);
 
     try {
       const result = await api.extractMateriality(pdfFile);
       setExtractedData(result);
+      cacheSet(key, result);
       alert("PDF extraction completed");
     } catch (error) {
       alert("Extraction failed: " + error.message);
@@ -160,9 +131,7 @@ export default function Materiality() {
     let benchmarkValue = 0;
 
     if (useManual) {
-      benchmarkValue =
-        Number(manualValue || 0) *
-        unitMultiplier[manualUnit];
+      benchmarkValue = Number(manualValue || 0) * unitMultiplier[manualUnit];
     } else {
       if (!extractedData?.figures?.length) {
         alert("No figures extracted from PDF");
@@ -170,20 +139,11 @@ export default function Materiality() {
       }
 
       const matchedFigure = extractedData.figures.find((item) =>
-        item.label
-          ?.toLowerCase()
-          .includes(
-            benchmark
-              .toLowerCase()
-              .split("(")[0]
-              .trim()
-          )
+        item.label?.toLowerCase().includes(benchmark.toLowerCase().split("(")[0].trim())
       );
 
       benchmarkValue =
-        matchedFigure?.value_float ||
-        extractedData.figures[0]?.value_float ||
-        0;
+        matchedFigure?.value_float || extractedData.figures[0]?.value_float || 0;
     }
 
     if (!benchmarkValue) {
@@ -191,24 +151,11 @@ export default function Materiality() {
       return;
     }
 
-    // overall materiality = user %
-    const overall =
-      benchmarkValue * (overallPct / 100);
+    const overall = benchmarkValue * (overallPct / 100);
+    const performance = overall * (performancePct / 100);
+    const tolerable = overall * (tolerablePct / 100);
 
-    // performance % of overall
-    const performance =
-      overall * (performancePct / 100);
-
-    // tolerable % of overall
-    const tolerable =
-      overall * (tolerablePct / 100);
-
-    setCalcResults({
-      benchmarkValue,
-      overall,
-      performance,
-      tolerable
-    });
+    setCalcResults({ benchmarkValue, overall, performance, tolerable });
   };
 
   const handleGenerateAnalysis = () => {
@@ -238,28 +185,27 @@ This materiality threshold aligns with ISA 320 planning standards and is suitabl
     }, 1000);
   };
 
+  const handleReset = () => {
+    if (pdfFile) {
+      cacheDel(buildCacheKey(pdfFile, "materiality-extract"));
+    }
+    setPdfFile(null);
+    setExtractedData(null);
+    setManualValue("");
+    setCalcResults(null);
+    setAnalysis("");
+    setFromCache(false);
+  };
+
   return (
     <div style={{ display: "flex", minHeight: "calc(100vh - 57px)" }}>
       {/* SIDEBAR */}
       <div className="sidebar">
-        <div
-          style={{
-            fontSize: "24px",
-            fontWeight: 400,
-            color: "#1a73e8",
-            marginBottom: "8px"
-          }}
-        >
+        <div style={{ fontSize: "24px", fontWeight: 400, color: "#1a73e8", marginBottom: "8px" }}>
           📊 Materiality
         </div>
 
-        <p
-          style={{
-            fontSize: "13px",
-            color: "#5f6368",
-            marginBottom: "24px"
-          }}
-        >
+        <p style={{ fontSize: "13px", color: "#5f6368", marginBottom: "24px" }}>
           Audit Planning Threshold Calculator
         </p>
 
@@ -272,13 +218,8 @@ This materiality threshold aligns with ISA 320 planning standards and is suitabl
           onChange={(e) => {
             const selected = e.target.value;
             setIndustry(selected);
-
             const config = INDUSTRY_DATA[selected];
-
-            setBenchmark(
-              Object.keys(config.benchmarks)[0]
-            );
-
+            setBenchmark(Object.keys(config.benchmarks)[0]);
             setPerformancePct(config.performance_pct);
             setTolerablePct(config.tolerable_pct);
           }}
@@ -292,76 +233,41 @@ This materiality threshold aligns with ISA 320 planning standards and is suitabl
         <select
           className="input"
           value={benchmark}
-          onChange={(e) =>
-            setBenchmark(e.target.value)
-          }
+          onChange={(e) => setBenchmark(e.target.value)}
         >
           {benchmarkOptions.map((item) => (
             <option key={item}>{item}</option>
           ))}
         </select>
 
-        {/* <div className="section-label">
-          Overall Materiality % (0–100)
-        </div>
-        <input
-          className="input"
-          type="number"
-          min="0"
-          max="100"
-          value={overallPct}
-          onChange={(e) =>
-            setOverallPct(Number(e.target.value))
-          }
-        /> */}
-
-        <div className="section-label">
-          Performance Materiality %
-        </div>
+        <div className="section-label">Performance Materiality %</div>
         <input
           className="input"
           type="number"
           min="0"
           max="100"
           value={performancePct}
-          onChange={(e) =>
-            setPerformancePct(Number(e.target.value))
-          }
+          onChange={(e) => setPerformancePct(Number(e.target.value))}
         />
 
-        <div className="section-label">
-          Tolerable Misstatement %
-        </div>
+        <div className="section-label">Tolerable Misstatement %</div>
         <input
           className="input"
           type="number"
           min="0"
           max="100"
           value={tolerablePct}
-          onChange={(e) =>
-            setTolerablePct(Number(e.target.value))
-          }
+          onChange={(e) => setTolerablePct(Number(e.target.value))}
         />
 
         <hr />
 
         <button
           className="btn btn-outlined"
-          onClick={() => {
-            setPdfFile(null);
-            setExtractedData(null);
-            setManualValue("");
-            setCalcResults(null);
-            setAnalysis("");
-          }}
+          onClick={handleReset}
           style={{ width: "100%" }}
         >
-          <DeleteIcon
-            sx={{
-              fontSize: 18,
-              marginRight: "8px"
-            }}
-          />
+          <DeleteIcon sx={{ fontSize: 18, marginRight: "8px" }} />
           Reset
         </button>
       </div>
@@ -371,27 +277,37 @@ This materiality threshold aligns with ISA 320 planning standards and is suitabl
         <h1>Audit Materiality Calculator</h1>
 
         <p style={{ marginBottom: "32px" }}>
-          Calculate overall materiality,
-          performance materiality, and tolerable
+          Calculate overall materiality, performance materiality, and tolerable
           misstatement thresholds for audit planning.
         </p>
 
         <div className="metric-card">
-          <div className="section-label">
-            Upload Financial Statements (PDF)
-          </div>
+          <div className="section-label">Upload Financial Statements (PDF)</div>
 
           <input
             type="file"
             accept=".pdf,.xlsx,.xls"
-            onChange={(e) =>
-              setPdfFile(e.target.files[0])
-            }
+            onChange={(e) => handleFileChange(e.target.files[0])}
           />
 
           {pdfFile && (
             <p style={{ marginTop: 12 }}>
               ✓ {pdfFile.name}
+              {fromCache && (
+                <span
+                  style={{
+                    marginLeft: 10,
+                    background: "#e8f0fe",
+                    color: "#1a73e8",
+                    padding: "2px 10px",
+                    borderRadius: 12,
+                    fontSize: 11,
+                    fontWeight: 600
+                  }}
+                >
+                  ⚡ FROM CACHE
+                </span>
+              )}
             </p>
           )}
 
@@ -401,67 +317,52 @@ This materiality threshold aligns with ISA 320 planning standards and is suitabl
             disabled={!pdfFile || extracting}
             style={{ marginTop: 16 }}
           >
-            <UploadIcon
-              sx={{
-                fontSize: 18,
-                marginRight: "8px"
-              }}
-            />
-            {extracting
-              ? "Extracting..."
-              : "Extract Figures"}
+            <UploadIcon sx={{ fontSize: 18, marginRight: "8px" }} />
+            {extracting ? "Extracting..." : fromCache ? "⚡ Re-use Cached" : "Extract Figures"}
           </button>
+
+          {fromCache && (
+            <button
+              className="btn btn-outlined"
+              onClick={async () => {
+                if (!pdfFile) return;
+                cacheDel(buildCacheKey(pdfFile, "materiality-extract"));
+                setFromCache(false);
+                setExtractedData(null);
+                await handleExtract();
+              }}
+              style={{ marginTop: 8, marginLeft: 8 }}
+            >
+              🔄 Re-process
+            </button>
+          )}
         </div>
 
-        <div
-          className="metric-card"
-          style={{ marginTop: 24 }}
-        >
-          <div className="section-label">
-            Manual Override
-          </div>
+        <div className="metric-card" style={{ marginTop: 24 }}>
+          <div className="section-label">Manual Override</div>
 
           <label>
             <input
               type="checkbox"
               checked={useManual}
-              onChange={(e) =>
-                setUseManual(
-                  e.target.checked
-                )
-              }
-            />
-            {" "}Use Manual Entry
+              onChange={(e) => setUseManual(e.target.checked)}
+            />{" "}
+            Use Manual Entry
           </label>
 
           {useManual && (
-            <div
-              style={{
-                display: "flex",
-                gap: 12,
-                marginTop: 16
-              }}
-            >
+            <div style={{ display: "flex", gap: 12, marginTop: 16 }}>
               <input
                 className="input"
                 type="number"
                 placeholder="Enter value"
                 value={manualValue}
-                onChange={(e) =>
-                  setManualValue(
-                    e.target.value
-                  )
-                }
+                onChange={(e) => setManualValue(e.target.value)}
               />
-
               <select
                 className="input"
                 value={manualUnit}
-                onChange={(e) =>
-                  setManualUnit(
-                    e.target.value
-                  )
-                }
+                onChange={(e) => setManualUnit(e.target.value)}
               >
                 <option>Units</option>
                 <option>Thousands</option>
@@ -472,17 +373,8 @@ This materiality threshold aligns with ISA 320 planning standards and is suitabl
           )}
         </div>
 
-        <button
-          className="btn"
-          onClick={handleCalculate}
-          style={{ marginTop: 24 }}
-        >
-          <CalculateIcon
-            sx={{
-              fontSize: 18,
-              marginRight: "8px"
-            }}
-          />
+        <button className="btn" onClick={handleCalculate} style={{ marginTop: 24 }}>
+          <CalculateIcon sx={{ fontSize: 18, marginRight: "8px" }} />
           Calculate Materiality
         </button>
 
@@ -492,42 +384,21 @@ This materiality threshold aligns with ISA 320 planning standards and is suitabl
               style={{
                 marginTop: 32,
                 display: "grid",
-                gridTemplateColumns:
-                  "repeat(3, 1fr)",
+                gridTemplateColumns: "repeat(3, 1fr)",
                 gap: 16
               }}
             >
               <div className="metric-card">
-                <div className="metric-label">
-                  Overall Materiality
-                </div>
-                <div className="metric-value">
-                  {formatCurrency(
-                    calcResults.overall
-                  )}
-                </div>
+                <div className="metric-label">Overall Materiality</div>
+                <div className="metric-value">{formatCurrency(calcResults.overall)}</div>
               </div>
-
               <div className="metric-card">
-                <div className="metric-label">
-                  Performance Materiality
-                </div>
-                <div className="metric-value">
-                  {formatCurrency(
-                    calcResults.performance
-                  )}
-                </div>
+                <div className="metric-label">Performance Materiality</div>
+                <div className="metric-value">{formatCurrency(calcResults.performance)}</div>
               </div>
-
               <div className="metric-card">
-                <div className="metric-label">
-                  Tolerable Misstatement
-                </div>
-                <div className="metric-value">
-                  {formatCurrency(
-                    calcResults.tolerable
-                  )}
-                </div>
+                <div className="metric-label">Tolerable Misstatement</div>
+                <div className="metric-value">{formatCurrency(calcResults.tolerable)}</div>
               </div>
             </div>
 
@@ -537,27 +408,14 @@ This materiality threshold aligns with ISA 320 planning standards and is suitabl
               onClick={handleGenerateAnalysis}
               disabled={generating}
             >
-              <DescriptionIcon
-                sx={{
-                  fontSize: 18,
-                  marginRight: "8px"
-                }}
-              />
-              {generating
-                ? "Generating..."
-                : "Generate Analysis"}
+              <DescriptionIcon sx={{ fontSize: 18, marginRight: "8px" }} />
+              {generating ? "Generating..." : "Generate Analysis"}
             </button>
           </>
         )}
 
         {analysis && (
-          <div
-            className="answer-box"
-            style={{
-              marginTop: 24,
-              whiteSpace: "pre-wrap"
-            }}
-          >
+          <div className="answer-box" style={{ marginTop: 24, whiteSpace: "pre-wrap" }}>
             {analysis}
           </div>
         )}
