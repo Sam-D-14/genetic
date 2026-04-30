@@ -6,6 +6,8 @@ import {
   Delete as DeleteIcon,
   ExpandMore as ExpandMoreIcon
 } from '@mui/icons-material';
+import { EditableExcelPreview } from '../../components/EditableExcelPreview';
+import { buildCacheKey, cacheGet, cacheSet, cacheDel } from '../../utils/excelCache';
 
 export default function TestingMR() {
   const [kbStatus, setKbStatus] = useState({
@@ -26,7 +28,8 @@ export default function TestingMR() {
   // DE Template state
   const [deFile, setDeFile] = useState(null);
   const [processing, setProcessing] = useState(false);
-  const [deResults, setDeResults] = useState(null);
+  const [deSheets, setDeSheets] = useState(null);    // parsed sheets for preview
+  const [fromCache, setFromCache] = useState(false);
 
   // Settings
   const [topK, setTopK] = useState(6);
@@ -70,11 +73,7 @@ export default function TestingMR() {
       const result = await api.ragQuery(query, topK);
 
       setHistory([
-        {
-          query,
-          answer: result.answer,
-          evidence: result.evidence
-        },
+        { query, answer: result.answer, evidence: result.evidence },
         ...history
       ]);
 
@@ -86,14 +85,46 @@ export default function TestingMR() {
     }
   };
 
+  // When a DE file is chosen, try to restore cached sheets
+  const handleDeFileChange = (file) => {
+    setDeFile(file);
+    setDeSheets(null);
+    setFromCache(false);
+
+    if (!file) return;
+
+    const key = buildCacheKey(file, 'de-template');
+    const cached = cacheGet(key);
+    if (cached) {
+      setDeSheets(cached);
+      setFromCache(true);
+    }
+  };
+
   const handleDEProcess = async () => {
     if (!deFile || !kbStatus.ready) return;
 
+    const key = buildCacheKey(deFile, 'de-template');
+
+    // Cache hit — skip API
+    const cached = cacheGet(key);
+    if (cached) {
+      setDeSheets(cached);
+      setFromCache(true);
+      return;
+    }
+
     setProcessing(true);
+    setFromCache(false);
+
     try {
-      await api.processDETemplate(deFile, topK);
-      alert('DE template processing complete! File downloaded.');
-      setDeFile(null);
+      // api.processDETemplate should return { sheets: [...] } for the preview
+      const result = await api.processDETemplate(deFile, topK);
+
+      // result is expected to have a .sheets property (same shape as Rag.js)
+      const sheets = result?.sheets ?? result;
+      setDeSheets(sheets);
+      cacheSet(key, sheets);
     } catch (error) {
       alert('Processing failed: ' + error.message);
     } finally {
@@ -101,28 +132,31 @@ export default function TestingMR() {
     }
   };
 
+  const handleReprocess = () => {
+    if (!deFile) return;
+    const key = buildCacheKey(deFile, 'de-template');
+    cacheDel(key);
+    setFromCache(false);
+    setDeSheets(null);
+    setTimeout(handleDEProcess, 100);
+  };
+
+  // Download edited sheets as xlsx via the preview component's built-in button
+  // or fall back to the original blob download
+  const downloadExcelFromSheets = (sheets) => {
+    // The EditableExcelPreview component already has a Download button wired
+    // to XLSX.writeFile, so nothing extra needed here.
+  };
+
   return (
     <div style={{ display: 'flex', minHeight: 'calc(100vh - 57px)' }}>
       {/* SIDEBAR */}
       <div className="sidebar">
-        <div
-          style={{
-            fontSize: '24px',
-            fontWeight: 400,
-            color: '#1a73e8',
-            marginBottom: '8px'
-          }}
-        >
+        <div style={{ fontSize: '24px', fontWeight: 400, color: '#1a73e8', marginBottom: '8px' }}>
           DE Audit RAG
         </div>
 
-        <p
-          style={{
-            fontSize: '13px',
-            color: '#5f6368',
-            marginBottom: '24px'
-          }}
-        >
+        <p style={{ fontSize: '13px', color: '#5f6368', marginBottom: '24px' }}>
           SOP Knowledge Base
         </p>
 
@@ -146,37 +180,15 @@ export default function TestingMR() {
               margin: '16px 0'
             }}
           >
-            <div
-              className="metric-card"
-              style={{
-                padding: '16px',
-                textAlign: 'center'
-              }}
-            >
-              <div
-                className="metric-value"
-                style={{
-                  fontSize: '24px'
-                }}
-              >
+            <div className="metric-card" style={{ padding: '16px', textAlign: 'center' }}>
+              <div className="metric-value" style={{ fontSize: '24px' }}>
                 {kbStatus.doc_count}
               </div>
               <div className="metric-label">DOCS</div>
             </div>
 
-            <div
-              className="metric-card"
-              style={{
-                padding: '16px',
-                textAlign: 'center'
-              }}
-            >
-              <div
-                className="metric-value"
-                style={{
-                  fontSize: '24px'
-                }}
-              >
+            <div className="metric-card" style={{ padding: '16px', textAlign: 'center' }}>
+              <div className="metric-value" style={{ fontSize: '24px' }}>
                 {kbStatus.chunk_count}
               </div>
               <div className="metric-label">CHUNKS</div>
@@ -189,13 +201,7 @@ export default function TestingMR() {
         {/* DOCUMENT UPLOAD */}
         <div className="section-label">Upload SOP Documents</div>
 
-        <div
-          className="file-upload"
-          style={{
-            padding: '24px',
-            marginBottom: '12px'
-          }}
-        >
+        <div className="file-upload" style={{ padding: '24px', marginBottom: '12px' }}>
           <input
             type="file"
             multiple
@@ -204,41 +210,16 @@ export default function TestingMR() {
             style={{ display: 'none' }}
             id="doc-upload"
           />
-
-          <label
-            htmlFor="doc-upload"
-            style={{
-              cursor: 'pointer',
-              display: 'block'
-            }}
-          >
-            <UploadIcon
-              sx={{
-                fontSize: 32,
-                color: '#5f6368',
-                marginBottom: '8px'
-              }}
-            />
-
-            <div
-              style={{
-                fontSize: '13px',
-                color: '#5f6368'
-              }}
-            >
+          <label htmlFor="doc-upload" style={{ cursor: 'pointer', display: 'block' }}>
+            <UploadIcon sx={{ fontSize: 32, color: '#5f6368', marginBottom: '8px' }} />
+            <div style={{ fontSize: '13px', color: '#5f6368' }}>
               Click to upload SOP PDF or DOCX files
             </div>
           </label>
         </div>
 
         {files.length > 0 && (
-          <div
-            style={{
-              fontSize: '13px',
-              color: '#5f6368',
-              marginBottom: '12px'
-            }}
-          >
+          <div style={{ fontSize: '13px', color: '#5f6368', marginBottom: '12px' }}>
             ✓ {files.length} file(s) selected
           </div>
         )}
@@ -257,14 +238,7 @@ export default function TestingMR() {
         {/* SETTINGS */}
         <div className="section-label">Settings</div>
 
-        <label
-          style={{
-            display: 'block',
-            fontSize: '13px',
-            color: '#5f6368',
-            marginBottom: '8px'
-          }}
-        >
+        <label style={{ display: 'block', fontSize: '13px', color: '#5f6368', marginBottom: '8px' }}>
           Source references to retrieve: <strong>{topK}</strong>
         </label>
 
@@ -274,11 +248,7 @@ export default function TestingMR() {
           max="10"
           value={topK}
           onChange={(e) => setTopK(parseInt(e.target.value))}
-          style={{
-            width: '100%',
-            accentColor: '#1a73e8',
-            marginBottom: '16px'
-          }}
+          style={{ width: '100%', accentColor: '#1a73e8', marginBottom: '16px' }}
         />
 
         <label
@@ -294,10 +264,7 @@ export default function TestingMR() {
             type="checkbox"
             checked={showEvidence}
             onChange={(e) => setShowEvidence(e.target.checked)}
-            style={{
-              marginRight: '8px',
-              accentColor: '#1a73e8'
-            }}
+            style={{ marginRight: '8px', accentColor: '#1a73e8' }}
           />
           Show retrieved chunks
         </label>
@@ -305,21 +272,17 @@ export default function TestingMR() {
         {kbStatus.ready && (
           <>
             <hr />
-
             <button
               className="btn btn-outlined"
               onClick={() => {
                 setHistory([]);
-                setDeResults(null);
+                setDeSheets(null);
+                setDeFile(null);
+                setFromCache(false);
               }}
               style={{ width: '100%' }}
             >
-              <DeleteIcon
-                sx={{
-                  fontSize: 18,
-                  marginRight: '8px'
-                }}
-              />
+              <DeleteIcon sx={{ fontSize: 18, marginRight: '8px' }} />
               Clear Results
             </button>
           </>
@@ -328,20 +291,18 @@ export default function TestingMR() {
 
       {/* MAIN CONTENT */}
       <div className="main-with-sidebar">
-        <h1> DE Audit Dynamic Query Assistant</h1>
+        <h1>DE Audit Dynamic Query Assistant</h1>
 
         <p style={{ marginBottom: '32px' }}>
-          Design Effectiveness audit analysis grounded strictly in uploaded
-          SOP documents.
+          Design Effectiveness audit analysis grounded strictly in uploaded SOP documents.
         </p>
 
         {!kbStatus.ready && (
           <div className="alert warning">
             <span style={{ fontSize: '20px' }}>⚠️</span>
             <div>
-              <strong>Knowledge Base not built.</strong> Upload documents in
-              the sidebar and click <em>Build Knowledge Base</em> to get
-              started.
+              <strong>Knowledge Base not built.</strong> Upload documents in the sidebar
+              and click <em>Build Knowledge Base</em> to get started.
             </div>
           </div>
         )}
@@ -349,43 +310,31 @@ export default function TestingMR() {
         {/* TABS */}
         <div className="tabs-container">
           <button
-            className={`tab-btn ${
-              activeTab === 'query' ? 'active' : ''
-            }`}
+            className={`tab-btn ${activeTab === 'query' ? 'active' : ''}`}
             onClick={() => setActiveTab('query')}
           >
-           RAG Query
+            RAG Query
           </button>
 
           <button
-            className={`tab-btn ${
-              activeTab === 'de' ? 'active' : ''
-            }`}
+            className={`tab-btn ${activeTab === 'de' ? 'active' : ''}`}
             onClick={() => setActiveTab('de')}
           >
             DE Template
           </button>
         </div>
 
-        {/* TAB 1 : QUERY */}
+        {/* ── TAB 1 : QUERY ── */}
         {activeTab === 'query' && (
           <div>
-            <div
-              style={{
-                display: 'flex',
-                gap: '12px',
-                marginBottom: '32px'
-              }}
-            >
+            <div style={{ display: 'flex', gap: '12px', marginBottom: '32px' }}>
               <input
                 type="text"
                 className="input"
                 placeholder="e.g. What is the frequency of the SVaR stress period selection control?"
                 value={query}
                 onChange={(e) => setQuery(e.target.value)}
-                onKeyPress={(e) =>
-                  e.key === 'Enter' && handleQuery()
-                }
+                onKeyPress={(e) => e.key === 'Enter' && handleQuery()}
                 disabled={!kbStatus.ready}
                 style={{ flex: 1 }}
               />
@@ -393,41 +342,23 @@ export default function TestingMR() {
               <button
                 className="btn"
                 onClick={handleQuery}
-                disabled={
-                  !kbStatus.ready || !query.trim() || loading
-                }
+                disabled={!kbStatus.ready || !query.trim() || loading}
               >
-                <SearchIcon
-                  sx={{
-                    fontSize: 18,
-                    marginRight: '8px'
-                  }}
-                />
+                <SearchIcon sx={{ fontSize: 18, marginRight: '8px' }} />
                 {loading ? 'Analyzing...' : 'Analyze'}
               </button>
             </div>
 
             {history.map((item, idx) => (
-              <div
-                key={idx}
-                style={{
-                  marginBottom: '32px'
-                }}
-              >
+              <div key={idx} style={{ marginBottom: '32px' }}>
                 <div className="section-label">Question</div>
-                <h3 style={{ marginBottom: '16px' }}>
-                  {item.query}
-                </h3>
+                <h3 style={{ marginBottom: '16px' }}>{item.query}</h3>
 
                 <div className="section-label">Analysis</div>
                 <div className="answer-box">{item.answer}</div>
 
                 {showEvidence && item.evidence.length > 0 && (
-                  <details
-                    style={{
-                      marginTop: '16px'
-                    }}
-                  >
+                  <details style={{ marginTop: '16px' }}>
                     <summary
                       style={{
                         cursor: 'pointer',
@@ -440,30 +371,15 @@ export default function TestingMR() {
                         gap: '8px'
                       }}
                     >
-                      <ExpandMoreIcon
-                        sx={{
-                          fontSize: 20
-                        }}
-                      />
-                      📄 Retrieved chunks ({item.evidence.length}
-                      retrieved)
+                      <ExpandMoreIcon sx={{ fontSize: 20 }} />
+                      📄 Retrieved chunks ({item.evidence.length} retrieved)
                     </summary>
 
                     <div style={{ marginTop: '12px' }}>
                       {item.evidence.map((e, i) => (
-                        <div
-                          key={i}
-                          className="evidence-card"
-                        >
-                          <div
-                            style={{
-                              marginBottom: '8px'
-                            }}
-                          >
-                            <span className="score-badge">
-                              score: {e.score.toFixed(3)}
-                            </span>
-
+                        <div key={i} className="evidence-card">
+                          <div style={{ marginBottom: '8px' }}>
+                            <span className="score-badge">score: {e.score.toFixed(3)}</span>
                             <span className="source-tag">
                               {e.source} · p.{e.page}
                             </span>
@@ -482,13 +398,7 @@ export default function TestingMR() {
                             </div>
                           )}
 
-                          <div
-                            style={{
-                              fontSize: '13px',
-                              color: '#202124',
-                              lineHeight: 1.6
-                            }}
-                          >
+                          <div style={{ fontSize: '13px', color: '#202124', lineHeight: 1.6 }}>
                             {e.text}
                           </div>
                         </div>
@@ -501,97 +411,108 @@ export default function TestingMR() {
           </div>
         )}
 
-        {/* TAB 2 : DE TEMPLATE */}
+        {/* ── TAB 2 : DE TEMPLATE ── */}
         {activeTab === 'de' && (
           <div>
-            <div
-              className="alert info"
-              style={{
-                marginBottom: '24px'
-              }}
-            >
+            <div className="alert info" style={{ marginBottom: '24px' }}>
               <span style={{ fontSize: '20px' }}>ℹ️</span>
-
               <div>
-                Upload the DE template Excel. Each sheet is processed
-                independently using SOP knowledge base.
+                Upload the DE template Excel. Each sheet is processed independently
+                using the SOP knowledge base.
                 <br />
                 <br />
-                Required columns:
-                <strong> Attribute</strong>,
-                <strong> Required Questions</strong>,
-                <strong> Considerations</strong>
+                Required columns: <strong>Attribute</strong>,{' '}
+                <strong>Required Questions</strong>, <strong>Considerations</strong>
               </div>
             </div>
 
-            <div
-              style={{
-                display: 'flex',
-                gap: '12px',
-                marginBottom: '24px'
-              }}
-            >
-              <div
-                className="file-upload"
-                style={{
-                  flex: 1,
-                  padding: '32px'
-                }}
-              >
+            {/* File upload + Run button row */}
+            <div style={{ display: 'flex', gap: '12px', marginBottom: '16px' }}>
+              <div className="file-upload" style={{ flex: 1, padding: '32px' }}>
                 <input
                   type="file"
                   accept=".xlsx"
-                  onChange={(e) =>
-                    setDeFile(e.target.files[0])
-                  }
+                  onChange={(e) => handleDeFileChange(e.target.files[0])}
                   style={{ display: 'none' }}
                   id="excel-upload"
                 />
-
-                <label
-                  htmlFor="excel-upload"
-                  style={{
-                    cursor: 'pointer',
-                    display: 'block'
-                  }}
-                >
-                  <UploadIcon
-                    sx={{
-                      fontSize: 40,
-                      color: '#5f6368',
-                      marginBottom: '12px'
-                    }}
-                  />
-
-                  <div
-                    style={{
-                      fontSize: '14px',
-                      color: '#5f6368',
-                      fontWeight: 500
-                    }}
-                  >
-                    {deFile
-                      ? `✓ ${deFile.name}`
-                      : 'Click to upload DE Template (.xlsx)'}
+                <label htmlFor="excel-upload" style={{ cursor: 'pointer', display: 'block' }}>
+                  <UploadIcon sx={{ fontSize: 40, color: '#5f6368', marginBottom: '12px' }} />
+                  <div style={{ fontSize: '14px', color: '#5f6368', fontWeight: 500 }}>
+                    {deFile ? `✓ ${deFile.name}` : 'Click to upload DE Template (.xlsx)'}
                   </div>
+                  {fromCache && deFile && (
+                    <div
+                      style={{
+                        marginTop: 8,
+                        display: 'inline-block',
+                        background: '#e8f0fe',
+                        color: '#1a73e8',
+                        padding: '2px 10px',
+                        borderRadius: 12,
+                        fontSize: 11,
+                        fontWeight: 600
+                      }}
+                    >
+                      ⚡ FROM CACHE
+                    </div>
+                  )}
                 </label>
               </div>
 
-              <button
-                className="btn"
-                onClick={handleDEProcess}
-                disabled={
-                  !kbStatus.ready || !deFile || processing
-                }
+              <div
                 style={{
+                  display: 'flex',
+                  flexDirection: 'column',
+                  gap: 8,
                   alignSelf: 'center'
                 }}
               >
-                {processing
-                  ? 'Processing...'
-                  : '▶ Run DE Analysis'}
-              </button>
+                <button
+                  className="btn"
+                  onClick={handleDEProcess}
+                  disabled={!kbStatus.ready || !deFile || processing}
+                >
+                  {processing ? 'Processing...' : fromCache ? '⚡ Load Cached' : '▶ Run DE Analysis'}
+                </button>
+
+                {fromCache && (
+                  <button
+                    className="btn btn-outlined"
+                    onClick={handleReprocess}
+                    style={{ fontSize: 12 }}
+                  >
+                    🔄 Re-process
+                  </button>
+                )}
+              </div>
             </div>
+
+            {/* Cache notification banner */}
+            {fromCache && deSheets && (
+              <div
+                style={{
+                  padding: '10px 16px',
+                  background: '#e8f0fe',
+                  borderRadius: 8,
+                  fontSize: 13,
+                  color: '#1a73e8',
+                  fontWeight: 600,
+                  marginBottom: 16
+                }}
+              >
+                ⚡ Showing cached results — click <em>Re-process</em> to re-run against the KB.
+              </div>
+            )}
+
+            {/* Excel Preview — shown once results are available */}
+            {deSheets && (
+              <EditableExcelPreview
+                data={{ sheets: Array.isArray(deSheets) ? deSheets : deSheets }}
+                filename={deFile ? deFile.name.replace('.xlsx', '_de_output.xlsx') : 'de_output.xlsx'}
+                height={520}
+              />
+            )}
           </div>
         )}
       </div>
